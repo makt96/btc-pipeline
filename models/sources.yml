@@ -1,0 +1,19 @@
+
+version: 2
+
+sources:
+  - name: btc
+    database: BTC_DEV
+    schema: RAW
+    tables:
+      - name: BTC_TRANSACTIONS
+        loaded_at_field: BLOCK_TIMESTAMP
+        freshness:
+          warn_after:
+            count: 1
+            period: hour
+          error_after:
+            count: 3
+            period: hour
+
+      - name: BTC_TRANSACTIONS_REGEX
