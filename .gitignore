@@ -20,3 +20,14 @@ __pycache__/
 .DS_Store
 # dbt state artifacts
 state/
+
+
+# Private keys and sensitive credentials
+*.p8
+*.pem
+*.key
+rsa_key*
+
+# Local dbt profile files
+profiles.yml
+.dbt/

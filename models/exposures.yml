@@ -1,0 +1,11 @@
+exposures:
+  - name: btc_whale_alert_dashboard
+    type: dashboard
+    owner:
+      name: Data Team
+    depends_on:
+      - ref('whale_alert' , v=2)
+    url: "https://datastudio.google.com/reporting/c7fe06ff-00e6-4e2c-8ccf-396a097ec4d4"
+    description: "Looker Studio dashboard for BTC whale alert metrics."
+    maturity: high
+    label: "BTC Whale Alert"

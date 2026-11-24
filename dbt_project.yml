@@ -1,5 +1,8 @@
 
-# Project configuration
+# ============================================================
+# PROJECT CONFIGURATION
+# ============================================================
+
 name: 'BTC'
 version: '1.0.0'
 config-version: 2
@@ -20,11 +23,22 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
-# Model configurations
+# ============================================================
+# MODEL CONFIGURATIONS
+# ============================================================
+
 models:
   BTC:
+
+    # Create a compatibility view pointing to the latest
+    # version of versioned models.
+    +post-hook:
+      - "{{ create_latest_version_view() }}"
+
+    # Staging layer
     staging:
       +materialized: view
 
+    # Marts layer
     marts:
       +materialized: table

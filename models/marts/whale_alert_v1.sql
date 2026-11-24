@@ -140,12 +140,16 @@ SELECT
     -- The sum of qualifying output values received
     -- by this address.
     w.TOTAL_SENT,
+    --w.TOTAL_SENT,
 
 
     -- The number of qualifying output rows associated
     -- with this address.
     w.TRANSACTION_COUNT,
 
+        -- Temporary column for the contract demonstration, understand violation of contract
+    --1 AS CONSTANT_VALUE,
+    --TO_VARCHAR(w.TRANSACTION_COUNT) AS TRANSACTION_COUNT,
 
     -- ========================================================
     -- CONVERT BITCOIN VALUE INTO US DOLLARS
