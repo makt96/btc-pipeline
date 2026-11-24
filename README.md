@@ -1,8 +1,10 @@
 # Bitcoin (BTC) Data Engineering Pipeline
 
-A Snowflake and dbt project that transforms raw Bitcoin transaction data into analytics-ready output records and a wallet-level **Whale Alert** mart. The project demonstrates layered data modeling, incremental processing, semi-structured JSON flattening, reusable dbt macros, data quality tests, and a Python model executed in Snowflake.
+A Snowflake and dbt project that transforms raw Bitcoin transaction data into analytics-ready output records and a wallet-level **Whale Alert** mart. The project demonstrates layered data modeling, incremental processing, semi-structured JSON flattening, reusable dbt macros, data quality tests, a Snowflake-hosted Python model, model versioning, and pull-request CI with GitHub Actions.
 
-> **Project status:** The core SQL pipeline has been built and successfully run in Snowflake. A parallel dbt Python model has also been executed successfully in the development workspace and its output has been validated. This README documents the implementation and validation completed to date; it does not imply that every production-hardening item listed below has been implemented.
+> **Project status:** The SQL pipeline and parallel Python output model have been built and validated in Snowflake. Whale Alert model versioning, a latest-version compatibility view, dbt exposures, custom tests, package dependencies, and GitHub Actions CI have also been added. A pull request from `dev2` to `main` completed its CI check successfully. Confirm the pull request's merge status in GitHub before assuming those changes are present on `main`.
+>
+> **CI scope:** The current GitHub Actions workflow runs `dbt debug`, `dbt deps`, and `dbt run` against the default `dev` target. It does not currently run `dbt test` or deploy to the `prod` target.
 
 ---
 
@@ -14,13 +16,15 @@ A Snowflake and dbt project that transforms raw Bitcoin transaction data into an
 - [Data sources](#data-sources)
 - [Project structure](#project-structure)
 - [Data models](#data-models)
-- [Python model](#python-model)
-- [Seed and reusable macro](#seed-and-reusable-macro)
+- [Seeds and reusable macros](#seeds-and-reusable-macros)
 - [Data quality and validation](#data-quality-and-validation)
+- [Model versioning and compatibility view](#model-versioning-and-compatibility-view)
+- [dbt exposure and dashboard](#dbt-exposure-and-dashboard)
 - [Snowflake environments](#snowflake-environments)
 - [Local setup](#local-setup)
 - [Running the project](#running-the-project)
 - [Using dbt state and defer](#using-dbt-state-and-defer)
+- [GitHub Actions CI](#github-actions-ci)
 - [Git workflow](#git-workflow)
 - [Known limitations and engineering considerations](#known-limitations-and-engineering-considerations)
 - [Potential next steps](#potential-next-steps)
@@ -32,12 +36,13 @@ A Snowflake and dbt project that transforms raw Bitcoin transaction data into an
 
 The pipeline starts with transaction-level Bitcoin data stored in a raw Snowflake table. dbt models prepare the transaction records, expand the nested `OUTPUTS` JSON array into individual output rows, exclude Coinbase transactions for downstream analysis, and aggregate qualifying output activity by Bitcoin address.
 
-The final `whale_alert` mart provides:
+The Whale Alert mart is versioned. Version 2 is configured as the latest version and provides:
 
 - Bitcoin output address.
 - Total qualifying Bitcoin output value per address.
 - Count of qualifying output rows per address.
-- Estimated USD value using the latest available non-null closing price in the project seed.
+
+The earlier V1 model also calculated an estimated USD value using the latest available non-null closing price in the project seed. V1 is disabled in the current dbt model-version configuration; V2 excludes that USD column.
 
 The project also contains a Python implementation of the JSON-output transformation. It uses pandas and simplejson in a Snowflake-hosted dbt Python model and provides a practical comparison with the SQL-based `LATERAL FLATTEN` implementation.
 
@@ -47,30 +52,38 @@ The project also contains a Python implementation of the JSON-output transformat
 2. Use dbt `source()` and `ref()` to define source relationships and model dependencies.
 3. Process transaction data with incremental `MERGE` and `APPEND` strategies.
 4. Flatten semi-structured Bitcoin transaction outputs.
-5. Reuse transformation logic through an ephemeral intermediate model and a custom macro.
-6. Apply dbt data quality tests to important transaction identifiers.
+5. Reuse transformation logic through an ephemeral intermediate model and custom macros.
+6. Apply dbt data quality tests, including a custom Bitcoin address test.
 7. Implement and validate a Python dbt model alongside the SQL implementation.
-8. Use separate development and production schemas and Git branches to support controlled changes.
+8. Use dbt model versions and a compatibility view to manage downstream dependencies.
+9. Document a Looker Studio dashboard as a dbt exposure.
+10. Use Git branches, pull requests, and GitHub Actions to validate changes before merging to `main`.
 
 ---
 
 ## Architecture
 
-The main SQL data flow is:
+The main transformation flow is:
 
 ```mermaid
 flowchart TD
     A[Snowflake RAW source\nBTC_TRANSACTIONS] --> B[stg_btc_transactions\nIncremental MERGE]
     B --> C[stg_btc_outputs\nIncremental APPEND\nLATERAL FLATTEN]
     C --> D[int_btc_non_coinbase_outputs\nEphemeral filter]
-    D --> E[whale_alert\nTable aggregation]
-    F[btc_usd_max.csv\ndbt seed] --> G[convert_to_usd macro]
-    G --> E
+    D --> E[whale_alert v1\nDisabled / deprecated]
+    D --> F[whale_alert v2\nLatest version]
+    F --> G[whale_top_ten\nLatest-version ref]
+    F --> H[WHALE_ALERT\nCompatibility view]
+    F --> I[Looker Studio exposure]
 
-    B --> H[staging_btc_outputs_python\nPython table model\nAlternative JSON flattening]
+    B --> J[staging_btc_outputs_python\nPython table model\nAlternative JSON flattening]
+    J -. row-count comparison .-> C
+
+    K[btc_usd_max.csv\ndbt seed] --> L[convert_to_usd macro]
+    L --> E
 ```
 
-The Python model is currently a **parallel implementation for learning and comparison**. The downstream `whale_alert` model continues to reference the SQL intermediate model `int_btc_non_coinbase_outputs`; it does not currently consume the Python model's output.
+The Python model is a **parallel implementation for learning and comparison**. The downstream Whale Alert models continue to use the SQL intermediate model `int_btc_non_coinbase_outputs`; they do not currently consume the Python model's output. The Python model is used as a comparison target by a row-count test.
 
 ### Logical layers
 
@@ -79,8 +92,9 @@ The Python model is currently a **parallel implementation for learning and compa
 | Raw | Stores source Bitcoin transaction data | `BTC_DEV.RAW.BTC_TRANSACTIONS` |
 | Staging | Standardizes transaction records and expands transaction outputs | `stg_btc_transactions`, `stg_btc_outputs` |
 | Intermediate | Applies reusable business filtering | `int_btc_non_coinbase_outputs` |
-| Marts | Produces aggregated, analytics-oriented results | `whale_alert` |
-| Supporting assets | Supplies reference data and reusable SQL logic | `btc_usd_max` seed, `convert_to_usd` macro |
+| Marts | Produces aggregated, analytics-oriented results | `whale_alert` V1/V2, `whale_top_ten` |
+| Supporting assets | Supplies reference data and reusable SQL logic | `btc_usd_max` seed, `convert_to_usd` macro, compatibility-view macro |
+| Analytics metadata | Documents downstream dashboard dependencies | `models/exposures.yml` |
 
 The intermediate model is logically part of the intermediate layer, although its SQL file is currently stored under `models/staging/` in the repository.
 
@@ -93,11 +107,14 @@ The intermediate model is logically part of the intermediate layer, although its
 | Snowflake | Cloud data warehouse and execution platform |
 | dbt Core 1.9.4 | SQL/Python model orchestration, dependency management, tests, and compilation |
 | dbt-snowflake 1.9.4 | dbt adapter for Snowflake |
-| Python 3.12 | Local runtime used for the dbt command-line environment |
+| Python 3.12 | Local dbt command-line runtime and GitHub Actions runtime |
 | pandas | DataFrame manipulation in the Snowflake Python model |
 | PyArrow | Supports pandas data transfer through the Snowflake Connector |
 | simplejson | Parses JSON values in the Python model |
-| Git and GitHub | Version control and branch-based development |
+| dbt-utils 1.4.1 | Provides reusable dbt tests, including `equal_rowcount` |
+| Git and GitHub | Version control, pull requests, and CI workflow execution |
+| GitHub Actions | Runs dbt connection, dependency, and model-build checks for pull requests |
+| Looker Studio | Dashboard documented through a dbt exposure |
 
 The Python model declares `pandas`, `pyarrow`, and `simplejson` in its dbt package configuration. Those packages are made available in the Snowflake Python execution environment for that model; pandas does not need to be installed locally just to execute the model.
 
@@ -124,7 +141,7 @@ The primary source contains transaction-level fields, including:
 - `IS_COINBASE`
 - `OUTPUTS` — semi-structured output data containing an array of JSON objects, including address and value fields.
 
-Source freshness is configured for `BTC_TRANSACTIONS` using `BLOCK_TIMESTAMP`, with a warning threshold of one hour and an error threshold of three hours. The source data observed during the latest project validation was not recent enough to satisfy those thresholds. Freshness therefore depends on the upstream raw-data loading process continuing to update the source.
+Source freshness is configured for `BTC_TRANSACTIONS` using `BLOCK_TIMESTAMP`, with a warning threshold of one hour and an error threshold of three hours. The source data observed during project validation was not recent enough to satisfy those thresholds. Freshness therefore depends on the upstream raw-data loading process continuing to update the source.
 
 The upstream raw ingestion process is outside the scope of the dbt transformations documented here. The models expect the raw source table to be populated before dbt runs.
 
@@ -132,31 +149,43 @@ The upstream raw ingestion process is outside the scope of the dbt transformatio
 
 ## Project structure
 
-The current project layout is organized as follows:
+The key project files and folders are:
 
 ```text
 BTC/
+├── .github/
+│   └── workflows/
+│       └── dbt-ci.yml                  # Pull-request CI workflow
 ├── dbt_project.yml
+├── packages.yml                        # dbt package declarations
+├── package-lock.yml                    # Resolved dbt package versions
 ├── models/
 │   ├── sources.yml
-│   ├── schema.yml
+│   ├── schema.yml                       # Tests, contracts, and model versions
+│   ├── exposures.yml                    # Looker Studio dashboard exposure
 │   ├── staging/
 │   │   ├── stg_btc_transactions.sql
 │   │   ├── stg_btc_outputs.sql
 │   │   ├── int_btc_non_coinbase_outputs.sql
 │   │   └── staging_btc_outputs_python.py
 │   └── marts/
-│       └── whale_alert.sql
+│       ├── whale_alert_v1.sql
+│       ├── whale_alert_v2.sql
+│       └── whale_top_ten.sql
 ├── macros/
-│   └── btc_utils.sql
+│   ├── btc_utils.sql                    # convert_to_usd macro
+│   └── create_latest_version_view.sql  # Latest-version compatibility view
 ├── seeds/
 │   └── btc_usd_max.csv
+├── tests/
+│   └── generic/
+│       └── crypto_utils.sql             # Bitcoin address generic test
 ├── state/
-│   └── manifest.json          # Saved dbt state artifact used for defer workflows
-└── target/                    # Generated dbt artifacts; recreated by dbt
+│   └── manifest.json                    # Saved dbt state for defer workflows
+└── target/                              # Generated dbt artifacts; recreated by dbt
 ```
 
-`target/`, `dbt_packages/`, logs, virtual environments, and local credentials are generated or machine-specific assets and should not be treated as application source code. The `state/manifest.json` file is a reference manifest used by the defer workflow; refresh it from the intended reference environment when needed.
+`target/`, `dbt_packages/`, logs, virtual environments, and local credentials are generated or machine-specific assets and should not be treated as application source code. The `state/manifest.json` file is a reference manifest used for the defer workflow; refresh it from the intended reference environment when needed.
 
 ---
 
@@ -164,9 +193,9 @@ BTC/
 
 ### 1. `stg_btc_transactions`
 
-**File:** `models/staging/stg_btc_transactions.sql`
-**Materialization:** Incremental
-**Incremental strategy:** `merge`
+**File:** `models/staging/stg_btc_transactions.sql`  
+**Materialization:** Incremental  
+**Incremental strategy:** `merge`  
 **Unique key:** `TRANSACTION_HASH`
 
 Reads the raw `BTC_TRANSACTIONS` source using `source('btc', 'BTC_TRANSACTIONS')` and retains the transaction-level columns, including the semi-structured `OUTPUTS` field.
@@ -175,8 +204,8 @@ On incremental runs, the model filters source records to timestamps greater than
 
 ### 2. `stg_btc_outputs`
 
-**File:** `models/staging/stg_btc_outputs.sql`
-**Materialization:** Incremental
+**File:** `models/staging/stg_btc_outputs.sql`  
+**Materialization:** Incremental  
 **Incremental strategy:** `append`
 
 Reads from `stg_btc_transactions` and uses Snowflake `LATERAL FLATTEN(INPUT => t.OUTPUTS)` to expand the JSON output array into individual rows. It extracts:
@@ -190,7 +219,7 @@ For incremental runs, it applies a timestamp filter against the latest `BLOCK_TI
 
 ### 3. `int_btc_non_coinbase_outputs`
 
-**File:** `models/staging/int_btc_non_coinbase_outputs.sql`
+**File:** `models/staging/int_btc_non_coinbase_outputs.sql`  
 **Materialization:** Ephemeral
 
 Selects all columns from `stg_btc_outputs` and filters to:
@@ -199,27 +228,12 @@ Selects all columns from `stg_btc_outputs` and filters to:
 WHERE IS_COINBASE = FALSE
 ```
 
-Because the model is ephemeral, dbt does not create a separate physical Snowflake table or view for it. Its SQL is incorporated into downstream models that reference it, such as `whale_alert`.
+Because the model is ephemeral, dbt does not create a separate physical Snowflake table or view for it. Its SQL is incorporated into downstream models that reference it.
 
-### 4. `whale_alert`
+### 4. `staging_btc_outputs_python`
 
-**File:** `models/marts/whale_alert.sql`
-**Materialization:** Table
-
-Aggregates non-Coinbase output records by `OUTPUT_ADDRESS`. The model:
-
-1. Filters individual output rows to `OUTPUT_VALUE > 10`.
-2. Calculates `SUM(OUTPUT_VALUE)` as `TOTAL_SENT` for each address.
-3. Calculates `COUNT(*)` as `TRANSACTION_COUNT`.
-4. Calls the `convert_to_usd` macro to calculate `TOTAL_SENT_USD`.
-5. Sorts results by `TOTAL_SENT_USD` in descending order.
-
-**Counting clarification:** `COUNT(*)` counts qualifying output rows. It does not count distinct transaction hashes, even though the output column is currently named `TRANSACTION_COUNT`.
-
-### 5. `staging_btc_outputs_python`
-
-**File:** `models/staging/staging_btc_outputs_python.py`
-**Materialization:** Table
+**File:** `models/staging/staging_btc_outputs_python.py`  
+**Materialization:** Table  
 **Execution:** Snowflake-hosted dbt Python model
 
 Implements an alternative JSON-flattening workflow using pandas and simplejson:
@@ -236,9 +250,45 @@ The model configuration requests `pandas`, `pyarrow`, and `simplejson` packages.
 
 **Schema naming difference:** The Python model outputs `ADDRESS` and `VALUE`; the SQL model `stg_btc_outputs` outputs `OUTPUT_ADDRESS` and `OUTPUT_VALUE`. They represent corresponding extracted fields but do not currently have identical column names.
 
+### 5. `whale_alert` V1 and V2
+
+**Files:**
+
+- `models/marts/whale_alert_v1.sql`
+- `models/marts/whale_alert_v2.sql`
+
+Both versions aggregate non-Coinbase output records by `OUTPUT_ADDRESS`. The current business filter is applied to individual output rows before aggregation:
+
+```sql
+OUTPUT_VALUE > 10
+```
+
+V1 calculates:
+
+- `OUTPUT_ADDRESS`
+- `TOTAL_SENT`
+- `TRANSACTION_COUNT`
+- `TOTAL_SENT_USD`
+
+V2 is the configured latest version and contains three columns:
+
+- `OUTPUT_ADDRESS`
+- `TOTAL_SENT`
+- `TRANSACTION_COUNT`
+
+The model contract is enforced for the versioned Whale Alert model. Version 2 excludes `TOTAL_SENT_USD` from its output.
+
+**Counting clarification:** `COUNT(*)` counts qualifying output rows. It does not count distinct transaction hashes, even though the output column is currently named `TRANSACTION_COUNT`.
+
+### 6. `whale_top_ten`
+
+**File:** `models/marts/whale_top_ten.sql`
+
+This downstream mart references `whale_alert` without pinning a specific version. Because V2 is configured as the latest version, the unpinned reference resolves to V2. This model demonstrates how downstream models can follow the configured latest version.
+
 ---
 
-## Seed and reusable macro
+## Seeds and reusable macros
 
 ### Seed: `btc_usd_max`
 
@@ -261,40 +311,50 @@ The `convert_to_usd(column_name)` macro accepts a SQL expression, retrieves the 
 
 The macro cleans the `EVENT_DATE` text by removing the ` UTC` suffix, converts it to a date with `TRY_TO_DATE`, sorts newest first, and uses `LIMIT 1` to select one closing-price row.
 
-In `whale_alert`, it is called as:
+V1 used the macro as:
 
 ```sql
 {{ convert_to_usd('w.TOTAL_SENT') }} AS TOTAL_SENT_USD
 ```
 
-The macro uses one latest available price for all addresses in the result. It does not perform historical price lookup by transaction date.
+The macro uses one latest available price for all addresses in the result. It does not perform historical price lookup by transaction date. V2 does not include the USD column.
+
+### Macro: `create_latest_version_view`
+
+**File:** `macros/create_latest_version_view.sql`
+
+This macro is called through the model post-hook configuration in `dbt_project.yml`. For the latest versioned model, it creates or replaces an unversioned compatibility view using the model's base name and selects from the latest versioned relation.
+
+For example, in the `dev2` target, the compatibility relation is:
+
+```text
+BTC_DEV.DBT_MARK.WHALE_ALERT
+```
+
+It points to the latest versioned Whale Alert model (`WHALE_ALERT_V2`). In the CI `dev` target, the corresponding relation is created in `BTC_DEV.DBT_DEVELOPMENT`.
+
+The compatibility view allows consumers that refer to the unversioned relation name to use the latest model output. Review this macro and the target schema before applying model changes to a production target.
 
 ---
 
 ## Data quality and validation
 
-### Configured dbt tests
+### Configured tests
 
-**File:** `models/schema.yml`
+The current dbt project includes these validation patterns:
 
-The project currently defines two column-level tests for `stg_btc_transactions.transaction_hash`:
+| Model / field | Test | Purpose |
+|---|---|---|
+| `stg_btc_transactions.transaction_hash` | `unique` | Detect duplicate transaction hashes |
+| `stg_btc_transactions.transaction_hash` | `not_null` | Ensure transaction hashes are populated |
+| `stg_btc_outputs` | `dbt_utils.equal_rowcount` against `staging_btc_outputs_python` | Compare row counts from the SQL and Python output implementations |
+| `whale_alert.output_address` | `assert_valid_btc_address` | Apply the project's custom Bitcoin address prefix check |
 
-| Test | What it verifies |
-|---|---|
-| `unique` | No duplicate transaction hash values are present in the model result. |
-| `not_null` | Every transaction row has a transaction hash. |
+The custom `assert_valid_btc_address` generic test is defined in `tests/generic/crypto_utils.sql`. It checks for supported address prefixes (`1`, `3`, and `bc1`). It is a format/prefix check, not full cryptographic validation of a Bitcoin address.
 
-Run the tests with:
+### Model contract
 
-```bash
-dbt test --target dev2
-```
-
-Or select the transaction model:
-
-```bash
-dbt test --target dev2 --select stg_btc_transactions
-```
+The versioned Whale Alert model uses an enforced dbt contract. The contract declares the expected column names and data types, and V2 excludes the V1-only `TOTAL_SENT_USD` field.
 
 ### Python model validation completed
 
@@ -308,20 +368,50 @@ The Python model was successfully executed in the `dev2` target and its resultin
 
 A sample of the table was also inspected to confirm that transaction fields were preserved and the extracted address/value fields were populated.
 
-A temporary debugging exception was used to inspect the DataFrame type. The Snowflake execution log confirmed:
+The SQL output model and Python output model had the same observed row count of 982,507 during validation. This is a row-count comparison, not a complete row-by-row equality test.
 
-```text
-<class 'pandas.core.frame.DataFrame'>
+### Commands for local testing
+
+Run all configured dbt tests with:
+
+```bash
+dbt test --target dev2
 ```
 
-The temporary exception was removed after the check. The successful model run was then restored.
+Run tests for a specific model selection with:
 
-### Previously completed execution checks
+```bash
+dbt test --target dev2 --select whale_alert
+```
 
-- The production-target dbt run completed successfully for the existing SQL pipeline models at that point in development.
-- The two configured transaction-hash tests passed in the production-target test run.
-- The Python model completed successfully in the `dev2` target after adding PyArrow to its requested packages.
-- The SQL output model and Python output model had the same observed row count of 982,507 during validation. This is a row-count comparison, not a complete row-by-row equality test.
+---
+
+## Model versioning and compatibility view
+
+The version configuration is maintained in `models/schema.yml`.
+
+- `whale_alert` has `latest_version: 2`.
+- V1 is disabled and has a deprecation date of `2026-01-01` in the project configuration.
+- V2 is the active latest version.
+- The V2 model contract excludes the V1-only `TOTAL_SENT_USD` field.
+- `whale_top_ten` uses an unpinned `ref('whale_alert')`, so it follows the configured latest version.
+- `models/exposures.yml` pins the dashboard exposure dependency to V2.
+
+The deprecation date is a dbt model-version configuration value; it does not itself delete a previously materialized Snowflake table. A relation left behind from an earlier run may need separate review and cleanup.
+
+The compatibility-view macro maintains the unversioned `WHALE_ALERT` relation as a view of the configured latest version. This is separate from dbt's versioned model relations.
+
+---
+
+## dbt exposure and dashboard
+
+**Configuration:** `models/exposures.yml`  
+**Dashboard:** BTC Whale Alert Dashboard  
+**Tool:** Looker Studio
+
+The exposure documents the downstream dashboard dependency on `whale_alert` version 2. This makes the dashboard relationship visible in dbt's project metadata and lineage documentation.
+
+The dashboard has been connected to the Snowflake Whale Alert output. Since V2 no longer includes `TOTAL_SENT_USD`, refresh the Looker Studio data source/schema and review any charts or calculated fields that depended on that removed column.
 
 ---
 
@@ -331,11 +421,11 @@ The dbt profile is named `BTC`. The project uses the `BTC_DEV` database and a Sn
 
 | dbt target | Output schema | Purpose |
 |---|---|---|
-| `dev` | `DBT_DEVELOPMENT` | Development workspace |
+| `dev` | `DBT_DEVELOPMENT` | CI and development workspace |
 | `dev2` | `DBT_MARK` | Separate development/experimentation workspace |
 | `prod` | `DBT_PRODUCTION` | Production-target schema |
 
-The target can be selected on the command line with `--target`. For example:
+The known profile configuration uses `DBT_DEVELOPER_ROLE` and `COMPUTE_WH`. The target can be selected on the command line with `--target`. For example:
 
 ```bash
 dbt debug --target dev2
@@ -384,7 +474,17 @@ Check the installation:
 dbt --version
 ```
 
-### 4. Configure the dbt profile
+### 4. Install dbt packages
+
+From the directory containing `dbt_project.yml`, run:
+
+```bash
+dbt deps
+```
+
+This installs the packages declared in `packages.yml`, including `dbt_utils`.
+
+### 5. Configure the dbt profile
 
 Create or update:
 
@@ -415,7 +515,7 @@ Configure the passphrase through your secure local environment or secret manager
 
 The actual profile also has `dev2` and `prod` outputs mapped to `DBT_MARK` and `DBT_PRODUCTION`, respectively. Add those targets to your local profile if you need to run against those schemas.
 
-### 5. Validate the connection
+### 6. Validate the connection
 
 ```bash
 dbt debug --target dev
@@ -457,13 +557,11 @@ dbt run --target dev2 --select whale_alert
 
 ### Run the Python model
 
-The Python model can be selected by its dbt model name:
-
 ```bash
 dbt run --target dev2 --select staging_btc_outputs_python
 ```
 
-When its upstream transaction model is not built in the selected development schema, use the state/defer workflow described below, provided the referenced production relation exists.
+When its upstream transaction model is not built in the selected development schema, use the state/defer workflow described below, provided the referenced relation exists in the target state manifest.
 
 ### Run data quality tests
 
@@ -479,7 +577,7 @@ dbt compile --target dev2
 
 Compilation renders dbt/Jinja code into executable SQL or Python model artifacts under `target/`. Generated files in `target/` are build artifacts, not the source files to edit.
 
-> **Production caution:** `dbt run --target prod` writes to the production-target schema. Review the model selection and generated SQL before running production commands.
+> **Production caution:** `dbt run --target prod` writes to the production-target schema. Review the model selection, hooks, and generated SQL before running production commands. The compatibility-view post-hook can create or replace the unversioned `WHALE_ALERT` view in the selected target schema.
 
 ---
 
@@ -511,17 +609,82 @@ dbt run --target dev2 --select staging_btc_outputs_python --defer --state state
 
 ---
 
+## GitHub Actions CI
+
+**Workflow file:** `.github/workflows/dbt-ci.yml`  
+**Workflow name:** `BTC dbt Continuous Integration`  
+**GitHub environment:** `DB_BTC`
+
+The workflow runs when a pull request targets `main`:
+
+```yaml
+on:
+  pull_request:
+    branches:
+      - main
+```
+
+### What the workflow does
+
+1. Checks out the repository.
+2. Sets up Python 3.12.16.
+3. Installs dbt Core 1.9.4 and dbt-snowflake 1.9.4.
+4. Creates the runner's dbt profile and encrypted RSA private-key file from GitHub environment secrets.
+5. Runs `dbt debug` to verify the Snowflake connection.
+6. Runs `dbt deps` to install dbt packages.
+7. Runs `dbt run` to build enabled dbt models.
+
+### GitHub environment secrets
+
+The `DB_BTC` environment uses these secret names:
+
+| Secret | Purpose |
+|---|---|
+| `DBT_PROFILES_YAML` | dbt profile YAML content for the GitHub runner |
+| `DBT_PRIVATE_KEY` | Encrypted RSA private-key content |
+| `DBT_ENV_SECRET_KEY_PASSPHRASE` | Passphrase used to decrypt the RSA private key |
+
+Secret **values** must remain in GitHub's environment-secret store and must never be committed to the repository or pasted into issues, pull requests, or chat messages.
+
+The workflow writes the profile to `$HOME/.dbt/profiles.yml` and the key to `$HOME/rsa_key_new.p8`. The GitHub profile secret must therefore use this runner key path:
+
+```yaml
+private_key_path: /home/runner/rsa_key_new.p8
+private_key_passphrase: "{{ env_var('DBT_ENV_SECRET_KEY_PASSPHRASE') }}"
+```
+
+The workflow uses the profile's default `dev` target. In the configured profile, that target writes to `BTC_DEV.DBT_DEVELOPMENT`, using `DBT_DEVELOPER_ROLE` and `COMPUTE_WH`. It does not build in `DBT_MARK` or `DBT_PRODUCTION` unless the workflow/profile is deliberately changed.
+
+### Environment deployment-branch restriction
+
+The `DB_BTC` GitHub environment is configured to allow the pull-request merge ref pattern:
+
+```text
+refs/pull/*/merge
+```
+
+The workflow itself is also limited to pull requests targeting `main`. Keep the environment rule and workflow trigger aligned if the CI trigger changes.
+
+### Current CI limitation
+
+The current workflow does **not** run `dbt test`, `dbt source freshness`, or a production deployment. Those can be considered as separate improvements after deciding which checks are appropriate for the CI environment and Snowflake permissions.
+
+A pull-request CI run completed successfully during development. That successful run covered the workflow's configured commands (`dbt debug`, `dbt deps`, and `dbt run`).
+
+---
+
 ## Git workflow
 
 The repository uses Git branches to separate stable work from ongoing development.
 
-The branch workflow completed to date is:
+The branch workflow to date includes:
 
-- `main` was created and pushed to GitHub.
-- `dev` was created for development work and later merged into `main` through a pull request.
-- `dev2` was created from the updated `main` branch for the next development stage.
+- `main` is the default branch.
+- `dev` was used for an earlier development cycle and merged through a pull request.
+- `dev2` is the current development branch used for the later model-versioning and CI work.
+- The recent `dev2` to `main` pull request completed its GitHub Actions CI check successfully. Confirm its current merge status in GitHub.
 
-At the latest project checkpoint, active work was taking place on the local `dev2` branch. Confirm the current local and remote branch state with:
+Useful commands for checking the local and remote branch state:
 
 ```bash
 git status
@@ -535,8 +698,9 @@ A typical future workflow is:
 2. Create or switch to a focused development branch.
 3. Make and validate model changes in a development target.
 4. Commit and push the branch.
-5. Open a pull request for review.
-6. Merge approved changes into `main`.
+5. Open a pull request targeting `main`.
+6. Review the GitHub Actions CI result.
+7. Merge only after the required checks and review are complete.
 
 ---
 
@@ -563,7 +727,7 @@ The output model uses `incremental_strategy='append'`. It inserts the rows selec
 
 ### 3. `TRANSACTION_COUNT` currently counts output rows
 
-In `whale_alert`, `COUNT(*)` counts qualifying output records grouped by address. It is not a count of distinct transactions. Consider changing the metric name or using `COUNT(DISTINCT TRANSACTION_HASH)` if the intended business definition is distinct transactions.
+In the Whale Alert models, `COUNT(*)` counts qualifying output records grouped by address. It is not a count of distinct transactions. Consider changing the metric name or using `COUNT(DISTINCT TRANSACTION_HASH)` if the intended business definition is distinct transactions.
 
 ### 4. The whale filter applies to each output
 
@@ -571,15 +735,23 @@ In `whale_alert`, `COUNT(*)` counts qualifying output records grouped by address
 
 ### 5. USD valuation is based on one latest seed price
 
-The macro applies the latest available non-null closing price to every aggregated address. It is not a historical valuation by block timestamp. The seed should also contain a deterministic unique latest date/price row; `LIMIT 1` alone does not define a stable choice if multiple rows tie for the latest date.
+The V1 macro applies the latest available non-null closing price to every aggregated address. It is not a historical valuation by block timestamp. The seed should also contain a deterministic unique latest date/price row; `LIMIT 1` alone does not define a stable choice if multiple rows tie for the latest date.
 
 ### 6. Python and SQL output schemas are not identical
 
-The Python model uses `ADDRESS` and `VALUE`; the SQL model uses `OUTPUT_ADDRESS` and `OUTPUT_VALUE`. A future parity check should compare records and normalize column naming before treating the two models as interchangeable.
+The Python model uses `ADDRESS` and `VALUE`; the SQL model uses `OUTPUT_ADDRESS` and `OUTPUT_VALUE`. A future parity check should normalize column naming before treating the two models as interchangeable. The configured `equal_rowcount` test checks only row counts, not row-by-row equality.
 
 ### 7. Source freshness depends on upstream ingestion
 
 The source freshness checks use one-hour warning and three-hour error thresholds. The raw source data observed during development was stale relative to those thresholds. Freshness checks will continue to report staleness until the upstream ingestion process updates the source.
+
+### 8. V2 does not include USD valuation
+
+The V2 Whale Alert model intentionally excludes `TOTAL_SENT_USD`. Downstream dashboards and consumers should use the V2 schema and should not assume the V1 USD column is available.
+
+### 9. CI is validation, not production deployment
+
+The current pull-request workflow builds against the `dev` target in `DBT_DEVELOPMENT`. It does not promote models to the `prod` target and does not run the dbt test suite. Treat the successful CI check as validation of the configured commands only.
 
 ---
 
@@ -587,15 +759,18 @@ The source freshness checks use one-hour warning and three-hour error thresholds
 
 These are suggested follow-up engineering tasks, not claims of completed work:
 
+- Add `dbt test` to the CI workflow after confirming the intended test scope and Snowflake permissions.
+- Consider adding `dbt source freshness` as a separate check, taking the upstream data freshness expectation into account.
 - Add a robust incremental strategy that accounts for late-arriving records and timestamp ties (for example, a lookback window with a suitable merge key).
 - Define a stable unique key for individual transaction outputs and test for duplicates.
-- Add data quality tests for output addresses, output values, and relevant timestamp fields.
+- Add data quality tests for output values and relevant timestamp fields.
 - Add a row-level comparison between the SQL and Python output models, not just a row-count comparison.
 - Decide whether `TRANSACTION_COUNT` should represent output count or distinct transaction count.
 - Add historical USD pricing by transaction/block date if historical valuation is required.
+- Review the `create_latest_version_view` post-hook behavior before enabling it in production.
+- Confirm the Looker Studio data source and charts reflect the V2 three-column schema.
+- Review GitHub branch protection and required-check settings for `main`.
 - Extend model and source documentation with column descriptions and business definitions.
-- Add automated validation in CI before merging changes to `main`.
-- Review source freshness thresholds and confirm that upstream ingestion is scheduled and healthy.
 
 ---
 
@@ -605,11 +780,15 @@ These are suggested follow-up engineering tasks, not claims of completed work:
 - Keep `profiles.yml` in `~/.dbt/`, outside the repository.
 - Keep private-key files outside the repository and restrict their filesystem permissions.
 - Use the `DBT_ENV_SECRET_KEY_PASSPHRASE` environment variable or an approved secret manager for the private-key passphrase.
+- Store CI credentials only as GitHub environment secrets; never place their values in this README or workflow source.
+- The repository `.gitignore` includes patterns for private keys and local dbt profile files. Continue reviewing `git status` before committing.
 - Do not commit raw customer-sensitive or otherwise restricted datasets unless explicitly approved.
-- Review `git status` before committing to ensure credentials, local environment files, and generated artifacts are not staged.
+- Review staged changes before committing to ensure credentials, local environment files, and generated artifacts are not included.
 
 ---
 
 ## Project summary
 
-This repository captures an end-to-end learning implementation of a Snowflake/dbt Bitcoin analytics pipeline: raw transaction data is staged, nested output arrays are flattened, non-Coinbase outputs are isolated, wallet-level activity is aggregated, and USD estimates are added through a reusable macro. The project also demonstrates dbt incremental models, ephemeral models, seeds, schema tests, Python models, deferred development against a production state manifest, and Git-based collaboration practices.
+This repository captures an end-to-end learning implementation of a Snowflake/dbt Bitcoin analytics pipeline: raw transaction data is staged, nested output arrays are flattened, non-Coinbase outputs are isolated, wallet-level activity is aggregated, and V1 USD estimates are calculated through a reusable macro. The project also demonstrates dbt incremental models, ephemeral models, seeds, schema contracts, generic and package-provided tests, a parallel Python model, model versioning, compatibility views, dbt exposures, deferred development against a saved state manifest, and pull-request CI with GitHub Actions.
+
+The CI workflow currently validates the Snowflake connection, installs dbt packages, and builds the default development target. Extending automated tests and defining a controlled production promotion process are logical future improvements.
