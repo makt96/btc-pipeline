@@ -1,0 +1,112 @@
+
+name: BTC dbt Continuous Integration
+
+# Run CI whenever a pull request targets main.
+on:
+  pull_request:
+    branches:
+      - main
+
+# Give the workflow read-only repository access.
+permissions:
+  contents: read
+
+jobs:
+  dbt-ci:
+    name: Validate BTC dbt Project
+    runs-on: ubuntu-latest
+    environment: DB_BTC
+    timeout-minutes: 30
+
+    # Pass the encrypted private-key passphrase securely.
+    env:
+      DBT_ENV_SECRET_KEY_PASSPHRASE: ${{ secrets.DBT_ENV_SECRET_KEY_PASSPHRASE }}
+
+    steps:
+
+      # ========================================================
+      # STEP 1: CHECK OUT THE GITHUB REPOSITORY
+      # ========================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # ========================================================
+      # STEP 2: SET UP PYTHON
+      # ========================================================
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12.16'
+
+      # ========================================================
+      # STEP 3: INSTALL DBT
+      # ========================================================
+
+      - name: Install dbt Core and Snowflake adapter
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install dbt-core==1.9.4 dbt-snowflake==1.9.4
+
+      # ========================================================
+      # STEP 4: CREATE DBT PROFILE AND PRIVATE KEY
+      # ========================================================
+
+      - name: Configure Snowflake authentication
+        shell: bash
+        env:
+          DBT_PROFILES_YAML: ${{ secrets.DBT_PROFILES_YAML }}
+          DBT_PRIVATE_KEY: ${{ secrets.DBT_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          # Verify that required GitHub secrets exist.
+          if [[ -z "$DBT_PROFILES_YAML" ]]; then
+            echo "::error::Missing DBT_PROFILES_YAML secret"
+            exit 1
+          fi
+
+          if [[ -z "$DBT_PRIVATE_KEY" ]]; then
+            echo "::error::Missing DBT_PRIVATE_KEY secret"
+            exit 1
+          fi
+
+          if [[ -z "$DBT_ENV_SECRET_KEY_PASSPHRASE" ]]; then
+            echo "::error::Missing DBT_ENV_SECRET_KEY_PASSPHRASE secret"
+            exit 1
+          fi
+
+          # Create the dbt profiles directory.
+          mkdir -p "$HOME/.dbt"
+
+          # Write the GitHub secret into profiles.yml.
+          printf '%s\n' "$DBT_PROFILES_YAML" > "$HOME/.dbt/profiles.yml"
+
+          # Write the encrypted RSA private key.
+          printf '%s\n' "$DBT_PRIVATE_KEY" > "$HOME/rsa_key_new.p8"
+
+          # Restrict access to the credential files.
+          chmod 600 "$HOME/.dbt/profiles.yml"
+          chmod 600 "$HOME/rsa_key_new.p8"
+
+      # ========================================================
+      # STEP 5: VERIFY SNOWFLAKE CONNECTION
+      # ========================================================
+
+      - name: Test Snowflake connection
+        run: dbt debug
+
+      # ========================================================
+      # STEP 6: INSTALL DBT PACKAGES
+      # ========================================================
+
+      - name: Install dbt packages
+        run: dbt deps
+
+      # ========================================================
+      # STEP 7: BUILD DBT MODELS
+      # ========================================================
+
+      - name: Run dbt models
+        run: dbt run
